@@ -1,41 +1,96 @@
-# Your agent goes here
+# Corridor Grant Advisor (ADK agent)
 
-This folder is empty on purpose.
+Ask in plain English ("What happens if Merchant Roots closes?", "We have $50k, compare
+these three applicants", "How many restaurants are in the corridor?"). The agent runs
+the BigQuery and graph queries in the background and answers, ending with a grant memo
+when you ask for a recommendation.
 
-We built the on-ramp: a real commercial corridor, real businesses, one fully real
-business-to-business relationship, two modeled ones built on published federal rates, a
-neighborhood need signal, and a validation suite that tells you plainly whether any of it is
-wrong. We did not build the vehicle. The design decisions in your agent are what you are judged
-on.
+## How it meets the challenge requirements
 
-## What has to be true of what you build here
+| Requirement | Where |
+|---|---|
+| ADK agent in Python | `grant_advisor/agent.py` (`root_agent`) |
+| Gemini | `GEMINI_MODEL` (default `gemini-3.6-flash`, via Vertex AI) |
+| Managed MCP server, consumed | Google's BigQuery MCP server `https://bigquery.googleapis.com/mcp` (`execute_sql`, `get_table_info`, `list_table_ids`) for open questions |
+| Custom tools with real logic | `grant_advisor/tools.py` + `scoring.py`: exposure weighting, replaceability, equity tilt, budget allocation, sensitivity checks |
+| Genuine multi-hop GQL | `grant_advisor/bq.py`: quantified `-[:Supplies]->{1,N}` shortlist, explicit 2-hop `MATCH (s)-[e1]->(m)-[e2]->(x)`, backward `{1,2}` upstream, and footfall-forward / supply-backward anchor traversal |
+| Deployed to Google Cloud | `deploy.sh` -> Cloud Run |
 
-- **An ADK agent**, in Python.
-- **At least one tool you built yourself.** A Python function tool, or one you defined in MCP
-  Toolbox—either counts. The obvious candidate wraps your cascade query. The more valuable one
-  holds the logic that is not a single query: deciding what counts as exposure, weighting a path,
-  turning a set of paths into a funding recommendation with an amount attached. Consuming only
-  prebuilt generic tools and calling that your design does not count.
-- **At least one Google-managed MCP server, consumed.** Do not author your own—use BigQuery's
-  built-in server or the [MCP Toolbox for Databases](https://github.com/googleapis/mcp-toolbox).
-- **Deployed to Google Cloud**—Agent Runtime or Cloud Run, your choice.
-- **Your required differentiator: a BigQuery property graph, genuinely traversed.** Your agent
-  must run a real multi-hop `MATCH`. A single-hop query, or a `JOIN` with the word "graph" in the
-  variable name, does not count—and it is the most common way a team misses the point while
-  appearing to hit it.
+## The decision rules (what judges will ask about)
 
-## The thing worth remembering while you build
+- **Dependence** of buyer B on supplier S = S's intensity / all modeled intensity into B.
+- **Replaceability**: if k other corridor businesses share S's 4-digit industry, the link counts 1/(1+k).
+- **Propagation**: 2-hop exposure = exposure of the middle business x its dependence x its replaceability. Strongest path wins (no double counting).
+- **Protected value** = sum of exposures, in business-equivalents (not jobs; per-business jobs are not public).
+- **Priority** = protected value x (1 + tract poverty rate).
+- **Amount**: budget shared by priority, clamped to $5k–$25k, in $500 steps.
+- **Assumption**: a grant cuts closure risk by 25% (`risk_reduction`, change it to test).
+- **Sensitivity**: the tool reports whether ranking by raw reach (centrality) or ignoring replaceability would pick a different winner.
 
-**A graph makes a consequence visible. It does not make the decision.**
+## Files
 
-The most connected business in your corridor is not automatically the best investment—it may
-simply be the most robust one. A business three hops downstream with a weak coefficient is barely
-affected by anything. And two of your three edge types are modeled by us, which should change
-how much weight a recommendation carries.
+```
+agent/
+  grant_advisor/
+    __init__.py
+    agent.py      # root agent, instructions, BigQuery MCP toolset
+    tools.py      # 4 custom tools the agent calls
+    scoring.py    # pure decision logic (tested offline)
+    bq.py         # all BigQuery / GQL queries
+    .env.example
+  tests/test_tools.py   # offline tests on the notebook's toy block
+  requirements.txt  Dockerfile  deploy.sh
+```
 
-An agent that ranks by centrality and funds the top of the list has rebuilt Section 2's wrong
-answer with extra steps. What you do *after* the traversal—deciding what exposure means,
-what the money actually changes, and what you are assuming—is where this becomes useful instead
-of merely clever.
+## Before you start
 
-See Section 13 of the notebook for the DDL shape and the seven traps.
+1. The six tables are in `a4i_econ` and the property graph exists:
+   `CREATE OR REPLACE PROPERTY GRAPH a4i_econ.LocalEconomy ...` (Section 13 DDL).
+2. Graph queries work in your project (the reservation). Test one in the console first.
+3. Know your dataset location: `US`, or `us-central1` if you moved it.
+
+## Run locally in Cloud Shell
+
+```bash
+cd agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp grant_advisor/.env.example grant_advisor/.env   # then edit project + BQ_LOCATION
+gcloud auth application-default login             # skip if Cloud Shell already has ADC
+adk web --allow_origins="*"                        # open the Web Preview on port 8000
+```
+
+Pick `grant_advisor` in the top-left dropdown and try:
+
+- "Which businesses would hurt the corridor most if they closed?"
+- "What happens if <name from the shortlist> closes?"
+- "Compare <A>, <B> and <C> for a $50,000 fund and write the grant memo."
+- "A large employer is leaving. Which block has the most jobs, and what's the impact?"
+- "How many businesses have an SBA loan that was charged off?"
+
+Offline tests (no BigQuery needed): `python -m pytest -q tests`
+
+## Deploy to Cloud Run
+
+```bash
+bash deploy.sh                           # dataset in US
+BQ_LOCATION=us-central1 bash deploy.sh   # dataset in us-central1
+```
+
+It enables the APIs, creates a service account with `aiplatform.user`,
+`bigquery.jobUser`, `bigquery.dataViewer` and `mcp.toolUser`, and deploys with
+min-instances 1. If the URL returns Forbidden (lab org policy), use
+`gcloud run services proxy grant-advisor --region us-central1 --port 8080`.
+
+The service runs `adk web`, so the same URL serves the chat UI and the REST API
+(`POST /run`, `POST /run_sse`) for the front-end lane.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Graph queries require a reservation` | Reservation not set up or still propagating |
+| `Not found: Dataset ... was not found in location US` | Set `BQ_LOCATION` to your dataset's location |
+| `property graph ... not found` | Run the `CREATE PROPERTY GRAPH` DDL; check `BQ_GRAPH` |
+| `404 model not found` | Set `GEMINI_MODEL` to a model your project has (e.g. `gemini-3.6-flash`) |
+| MCP tools fail with 403 | `gcloud beta services mcp enable bigquery.googleapis.com`; grant `roles/mcp.toolUser` |
